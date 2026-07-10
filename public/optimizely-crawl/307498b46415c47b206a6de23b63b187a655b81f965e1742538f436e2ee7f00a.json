@@ -1,0 +1,10 @@
+{
+  "SourceUrl": "https://opal.optimizely.com/agents/agent-directory",
+  "PageTitle": "Opal App",
+  "BodyHtml": "<!doctype html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"><title>Opal App</title><link href=\"https://cdn.opal.optimizely.com/opal-app-frontend-prod/icon.svg\" rel=\"icon\"><script defer src=\"https://cdn.opal.optimizely.com/opal-app-frontend-prod/static/runtime.7b64765e68136422.js\"></script><script defer src=\"https://cdn.opal.optimizely.com/opal-app-frontend-prod/static/vendor..pnpm.279c76238f502b8a.js\"></script><script defer src=\"https://cdn.opal.optimizely.com/opal-app-frontend-prod/static/main.c541e5a70686b5ce.js\"></script><link as=\"font\" crossorigin href=\"https://cdn.opal.optimizely.com/opal-app-frontend-prod/static/InterVariable.0336a89fb4e7fc1d.woff2\" rel=\"preload\" type=\"font/woff2\"></head><body><div id=\"root\"></div></body></html>",
+  "BodyMarkdown": "Opal App",
+  "HttpStatus": 200,
+  "ContentHash": "307498b46415c47b206a6de23b63b187a655b81f965e1742538f436e2ee7f00a",
+  "CrawledAt": "2026-07-08T18:19:42.605Z",
+  "RunId": "4b630c84-e656-4ad7-bfcd-26261989b003"
+}
