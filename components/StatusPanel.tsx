@@ -20,6 +20,8 @@ interface Props {
 }
 
 const POLL_INTERVAL_MS = 10_000;
+const MAX_CONSECUTIVE_ERRORS = 5;
+const MAX_POLL_INTERVAL_MS = 60_000;
 
 export default function StatusPanel({ importId, credentials, expectedItems, active, onBootstrapComplete }: Props) {
   const [status, setStatus] = useState<ImportStatus | null>(null);
@@ -27,12 +29,16 @@ export default function StatusPanel({ importId, credentials, expectedItems, acti
   const [pollError, setPollError] = useState<string | null>(null);
   const [countdown, setCountdown] = useState(POLL_INTERVAL_MS / 1000);
   const [isDone, setIsDone] = useState(false);
+  const [consecutiveErrors, setConsecutiveErrors] = useState(0);
+  const [pollingStopped, setPollingStopped] = useState(false);
+  const currentIntervalRef = useRef(POLL_INTERVAL_MS);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Keep latest values accessible inside the setInterval closure without re-creating it
   const expectedItemsRef = useRef(expectedItems);
   const onCompleteRef = useRef(onBootstrapComplete);
   const prevActiveRef = useRef(active);
+  const pollRef = useRef<(() => Promise<void>) | null>(null);
 
   useEffect(() => {
     expectedItemsRef.current = expectedItems;
@@ -57,11 +63,12 @@ export default function StatusPanel({ importId, credentials, expectedItems, acti
       setStatus(result);
       setLastUpdated(new Date());
       setPollError(null);
+      setConsecutiveErrors(0);
+      currentIntervalRef.current = POLL_INTERVAL_MS;
 
       const expected = expectedItemsRef.current;
 
       if (result.bootstrap === 'ready' && result.counts.enqueued >= expected) {
-        // Terminal success — all items accounted for and bootstrap finished
         setIsDone(true);
         stopPolling();
         onCompleteRef.current?.('ready');
@@ -70,14 +77,47 @@ export default function StatusPanel({ importId, credentials, expectedItems, acti
         stopPolling();
         onCompleteRef.current?.('error', result.bootstrapError ?? 'Unknown bootstrap error');
       }
-      // If bootstrap===ready but enqueued < expected, the items are still being
-      // sent — keep polling until they catch up.
     } catch (e) {
-      setPollError(e instanceof Error ? e.message : 'Failed to fetch status');
+      const errMsg = e instanceof Error ? e.message : 'Failed to fetch status';
+      setPollError(errMsg);
+      setConsecutiveErrors((prev) => {
+        const next = prev + 1;
+        if (next >= MAX_CONSECUTIVE_ERRORS) {
+          stopPolling();
+          setPollingStopped(true);
+        } else {
+          currentIntervalRef.current = Math.min(
+            currentIntervalRef.current * 2,
+            MAX_POLL_INTERVAL_MS
+          );
+          if (timerRef.current) {
+            clearInterval(timerRef.current);
+            timerRef.current = setInterval(() => pollRef.current?.(), currentIntervalRef.current);
+          }
+        }
+        return next;
+      });
     }
 
-    setCountdown(POLL_INTERVAL_MS / 1000);
+    setCountdown(currentIntervalRef.current / 1000);
   }, [importId, credentials, stopPolling]);
+
+  useEffect(() => {
+    pollRef.current = poll;
+  }, [poll]);
+
+  const resumePolling = useCallback(() => {
+    if (isDone) return;
+    setPollingStopped(false);
+    setConsecutiveErrors(0);
+    setPollError(null);
+    currentIntervalRef.current = POLL_INTERVAL_MS;
+    pollRef.current?.();
+    timerRef.current = setInterval(() => pollRef.current?.(), POLL_INTERVAL_MS);
+    countdownRef.current = setInterval(() => {
+      setCountdown((c) => Math.max(0, c - 1));
+    }, 1000);
+  }, [isDone]);
 
   // Start polling whenever importId changes (new import session).
   // StatusPanel is keyed by importId in the parent so this effect starts fresh
@@ -90,7 +130,7 @@ export default function StatusPanel({ importId, credentials, expectedItems, acti
     poll();
 
     // Poll every 10s
-    timerRef.current = setInterval(poll, POLL_INTERVAL_MS);
+    timerRef.current = setInterval(() => pollRef.current?.(), POLL_INTERVAL_MS);
 
     // Countdown ticker (decrements each second, reset to 10 after each poll)
     countdownRef.current = setInterval(() => {
@@ -135,7 +175,19 @@ export default function StatusPanel({ importId, credentials, expectedItems, acti
         <>
           {pollError && (
             <div className="text-xs text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded px-3 py-2">
-              Poll error: {pollError}
+              {pollingStopped ? (
+                <div className="flex items-center justify-between">
+                  <span>Status polling failed after {MAX_CONSECUTIVE_ERRORS} attempts: {pollError}</span>
+                  <button
+                    onClick={resumePolling}
+                    className="ml-2 text-red-700 dark:text-red-300 underline hover:no-underline font-medium"
+                  >
+                    Retry
+                  </button>
+                </div>
+              ) : (
+                <span>Poll error ({consecutiveErrors}/{MAX_CONSECUTIVE_ERRORS}): {pollError}</span>
+              )}
             </div>
           )}
 
