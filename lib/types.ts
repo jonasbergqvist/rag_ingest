@@ -76,19 +76,22 @@ export interface TenantStatusResponse {
 export interface BatchState {
   batchIndex: number;
   itemCount: number;
-  status: "pending" | "sending" | "done" | "error";
+  status: 'pending' | 'sending' | 'done' | 'error';
   error?: string;
+  errorStatus?: number;
+  itemUrls?: string[];
 }
 
 // Overall import session state
 export type ImportPhase =
-  | "idle"
-  | "starting"
-  | "sending"
-  | "done_sent"
-  | "bootstrapping"
-  | "complete"
-  | "error";
+  | 'idle'
+  | 'starting'
+  | 'sending'
+  | 'awaiting_decision'
+  | 'done_sent'
+  | 'bootstrapping'
+  | 'complete'
+  | 'error';
 
 export interface ImportSession {
   phase: ImportPhase;
