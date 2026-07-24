@@ -1,5 +1,6 @@
 'use client';
 
+import { useState } from 'react';
 import type { BatchState, ImportPhase } from '@/lib/types';
 
 interface Props {
@@ -8,12 +9,16 @@ interface Props {
   totalItems: number;
   importId: string | null;
   error?: string;
+  onRetryFailed?: () => void;
+  onBootstrapAnyway?: () => void;
+  onStartOver?: () => void;
 }
 
 const PhaseLabel: Record<ImportPhase, string> = {
   idle: 'Idle',
   starting: 'Starting import...',
   sending: 'Sending items...',
+  awaiting_decision: 'Action required',
   done_sent: 'Signalling done...',
   bootstrapping: 'Bootstrapping (see status panel)',
   complete: 'Import complete',
@@ -24,13 +29,14 @@ const PhaseColor: Record<ImportPhase, string> = {
   idle: 'text-gray-500',
   starting: 'text-blue-600 dark:text-blue-400',
   sending: 'text-blue-600 dark:text-blue-400',
+  awaiting_decision: 'text-yellow-600 dark:text-yellow-400',
   done_sent: 'text-blue-600 dark:text-blue-400',
   bootstrapping: 'text-yellow-600 dark:text-yellow-400',
   complete: 'text-green-600 dark:text-green-400',
   error: 'text-red-600 dark:text-red-400',
 };
 
-export default function BatchProgress({ phase, batches, totalItems, importId, error }: Props) {
+export default function BatchProgress({ phase, batches, totalItems, importId, error, onRetryFailed, onBootstrapAnyway, onStartOver }: Props) {
   const sentItems = batches
     .filter((b) => b.status === 'done')
     .reduce((sum, b) => sum + b.itemCount, 0);
@@ -67,23 +73,9 @@ export default function BatchProgress({ phase, batches, totalItems, importId, er
             />
           </div>
 
-          <div className="space-y-1 max-h-48 overflow-y-auto">
+          <div className="space-y-1 max-h-64 overflow-y-auto">
             {batches.map((batch) => (
-              <div
-                key={batch.batchIndex}
-                className="flex items-center justify-between text-sm px-3 py-2 rounded bg-gray-50 dark:bg-gray-800"
-              >
-                <div className="flex items-center gap-2">
-                  <BatchIcon status={batch.status} />
-                  <span className="text-gray-700 dark:text-gray-300">
-                    Batch {batch.batchIndex + 1}
-                  </span>
-                  <span className="text-gray-500 dark:text-gray-400 text-xs">
-                    ({batch.itemCount} items)
-                  </span>
-                </div>
-                <StatusBadge status={batch.status} />
-              </div>
+              <BatchRow key={batch.batchIndex} batch={batch} />
             ))}
           </div>
         </>
@@ -102,6 +94,50 @@ export default function BatchProgress({ phase, batches, totalItems, importId, er
           </p>
         </div>
       )}
+
+      {phase === 'awaiting_decision' && (() => {
+        const failed = batches.filter((b) => b.status === 'error');
+        const succeeded = batches.filter((b) => b.status === 'done');
+        return (
+          <div className="rounded-md bg-yellow-50 dark:bg-yellow-950 border border-yellow-200 dark:border-yellow-800 p-4 space-y-3">
+            <div>
+              <p className="text-sm font-medium text-yellow-800 dark:text-yellow-200">
+                {succeeded.length} of {batches.length} batches succeeded. {failed.length} failed.
+              </p>
+              <p className="text-xs text-yellow-700 dark:text-yellow-300 mt-1">
+                {succeeded.reduce((s, b) => s + b.itemCount, 0)} items sent successfully.
+                {' '}{failed.reduce((s, b) => s + b.itemCount, 0)} items need attention.
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {onRetryFailed && (
+                <button
+                  onClick={onRetryFailed}
+                  className="px-3 py-1.5 text-sm font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+                >
+                  Retry Failed ({failed.length})
+                </button>
+              )}
+              {onBootstrapAnyway && succeeded.length > 0 && (
+                <button
+                  onClick={onBootstrapAnyway}
+                  className="px-3 py-1.5 text-sm font-medium rounded-md border border-yellow-400 dark:border-yellow-600 text-yellow-800 dark:text-yellow-200 hover:bg-yellow-100 dark:hover:bg-yellow-900 transition-colors"
+                >
+                  Bootstrap Anyway ({succeeded.reduce((s, b) => s + b.itemCount, 0)} items)
+                </button>
+              )}
+              {onStartOver && (
+                <button
+                  onClick={onStartOver}
+                  className="px-3 py-1.5 text-sm font-medium rounded-md border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+                >
+                  Start Over
+                </button>
+              )}
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
@@ -144,4 +180,75 @@ function StatusBadge({ status }: { status: BatchState['status'] }) {
       {status}
     </span>
   );
+}
+
+function BatchRow({ batch }: { batch: BatchState }) {
+  const [expanded, setExpanded] = useState(false);
+  const hasDetail = batch.status === 'error' && (batch.error || batch.itemUrls);
+
+  return (
+    <div className="rounded bg-gray-50 dark:bg-gray-800">
+      <div
+        className={[
+          'flex items-center justify-between text-sm px-3 py-2',
+          hasDetail ? 'cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700' : '',
+        ].join(' ')}
+        onClick={() => hasDetail && setExpanded(!expanded)}
+      >
+        <div className="flex items-center gap-2">
+          <BatchIcon status={batch.status} />
+          <span className="text-gray-700 dark:text-gray-300">
+            Batch {batch.batchIndex + 1}
+          </span>
+          <span className="text-gray-500 dark:text-gray-400 text-xs">
+            ({batch.itemCount} items)
+          </span>
+          {hasDetail && (
+            <svg
+              className={`w-3 h-3 text-gray-400 transition-transform ${expanded ? 'rotate-90' : ''}`}
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+            </svg>
+          )}
+        </div>
+        <StatusBadge status={batch.status} />
+      </div>
+      {expanded && hasDetail && (
+        <div className="px-3 pb-2 space-y-1">
+          {batch.error && (
+            <p className="text-xs text-red-600 dark:text-red-400">
+              {batch.errorStatus ? `${friendlyStatus(batch.errorStatus)}: ` : ''}
+              {batch.error}
+            </p>
+          )}
+          {batch.itemUrls && batch.itemUrls.length > 0 && (
+            <div className="text-xs text-gray-500 dark:text-gray-400">
+              <p className="font-medium">Items in this batch:</p>
+              <ul className="mt-0.5 space-y-0.5 font-mono">
+                {batch.itemUrls.map((url, i) => (
+                  <li key={i} className="truncate">{url}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function friendlyStatus(status: number): string {
+  const map: Record<number, string> = {
+    408: 'Request Timeout (408)',
+    413: 'Payload Too Large (413)',
+    429: 'Rate Limited (429)',
+    500: 'Server Error (500)',
+    502: 'Bad Gateway (502)',
+    503: 'Service Unavailable (503)',
+    504: 'Gateway Timeout (504)',
+  };
+  return map[status] ?? `HTTP ${status}`;
 }
