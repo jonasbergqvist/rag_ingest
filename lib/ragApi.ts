@@ -15,32 +15,86 @@ function buildAuthHeader(appKey: string, secret: string): string {
   return `Basic ${encoded}`;
 }
 
+const RETRYABLE_STATUS_CODES = new Set([408, 429, 502, 503, 504]);
+const MAX_ATTEMPTS = 3;
+const BASE_DELAY_MS = 1000;
+
+export class RagFetchError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'RagFetchError';
+    this.status = status;
+  }
+}
+
+function getRetryDelay(attempt: number, response?: Response): number {
+  const retryAfter = response?.headers.get('Retry-After');
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (!Number.isNaN(seconds)) return seconds * 1000;
+  }
+  const jitter = Math.random() * 500;
+  return BASE_DELAY_MS * Math.pow(2, attempt) + jitter;
+}
+
+function isRetryable(error: unknown): boolean {
+  if (error instanceof RagFetchError) {
+    return RETRYABLE_STATUS_CODES.has(error.status);
+  }
+  return error instanceof TypeError;
+}
+
 async function ragFetch<T>(
   url: string,
   credentials: RagCredentials,
   options: RequestInit = {}
 ): Promise<T> {
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      Authorization: buildAuthHeader(credentials.appKey, credentials.secret),
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
+  let lastError: unknown;
 
-  if (!response.ok) {
-    let errorMessage = `HTTP ${response.status}`;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
-      const body = await response.json();
-      errorMessage = body.message ?? body.error ?? errorMessage;
-    } catch {
-      // ignore parse errors
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          Authorization: buildAuthHeader(credentials.appKey, credentials.secret),
+          'Content-Type': 'application/json',
+          ...options.headers,
+        },
+      });
+
+      if (!response.ok) {
+        let errorMessage = `HTTP ${response.status}`;
+        try {
+          const body = await response.json();
+          errorMessage = body.message ?? body.error ?? errorMessage;
+        } catch {
+          // ignore parse errors
+        }
+        const error = new RagFetchError(errorMessage, response.status);
+
+        if (isRetryable(error) && attempt < MAX_ATTEMPTS - 1) {
+          await new Promise((r) => setTimeout(r, getRetryDelay(attempt, response)));
+          lastError = error;
+          continue;
+        }
+        throw error;
+      }
+
+      return response.json() as Promise<T>;
+    } catch (e) {
+      lastError = e;
+      if (e instanceof RagFetchError) throw e;
+
+      if (isRetryable(e) && attempt < MAX_ATTEMPTS - 1) {
+        await new Promise((r) => setTimeout(r, getRetryDelay(attempt)));
+        continue;
+      }
+      throw e;
     }
-    throw new Error(errorMessage);
   }
 
-  return response.json() as Promise<T>;
+  throw lastError;
 }
 
 /**
@@ -143,5 +197,37 @@ export function chunkArray<T>(arr: T[], size: number): T[][] {
   for (let i = 0; i < arr.length; i += size) {
     chunks.push(arr.slice(i, i + size));
   }
+  return chunks;
+}
+
+const MAX_BATCH_BYTES = 900_000; // ~900KB, conservative margin under 1 MiB server limit
+const ENVELOPE_OVERHEAD = 100; // {"importId":"...","items":[]} wrapper
+
+/**
+ * Group items into batches that fit within the server's body size limit.
+ * Each item is measured by its JSON-serialized length. Items that individually
+ * exceed the limit are sent as solo batches (the server may still reject them,
+ * but we don't compound the problem by grouping them).
+ */
+export function chunkItemsBySize(items: CrawledItem[]): CrawledItem[][] {
+  const chunks: CrawledItem[][] = [];
+  let current: CrawledItem[] = [];
+  let currentSize = ENVELOPE_OVERHEAD;
+
+  for (const item of items) {
+    const itemSize = JSON.stringify(item).length + 1; // +1 for array comma
+    if (current.length > 0 && currentSize + itemSize > MAX_BATCH_BYTES) {
+      chunks.push(current);
+      current = [];
+      currentSize = ENVELOPE_OVERHEAD;
+    }
+    current.push(item);
+    currentSize += itemSize;
+  }
+
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+
   return chunks;
 }
