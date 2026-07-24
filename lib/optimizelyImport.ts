@@ -25,14 +25,3 @@ export async function fetchOptimizelyItem(fileName: string): Promise<CrawledItem
   }
   return response.json() as Promise<CrawledItem>;
 }
-
-export async function loadOptimizelyBatch(
-  files: string[],
-  batchIndex: number,
-  batchSize: number
-): Promise<CrawledItem[]> {
-  const start = batchIndex * batchSize;
-  const slice = files.slice(start, start + batchSize);
-  const items = await Promise.all(slice.map((file) => fetchOptimizelyItem(file)));
-  return items;
-}
