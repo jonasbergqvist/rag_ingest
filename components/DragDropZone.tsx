@@ -12,11 +12,13 @@ export default function DragDropZone({ onItemsLoaded, disabled }: Props) {
   const [isDragging, setIsDragging] = useState(false);
   const [parseError, setParseError] = useState<string | null>(null);
   const [loadedCount, setLoadedCount] = useState<number | null>(null);
+  const [parseWarnings, setParseWarnings] = useState<string[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const processFiles = useCallback(
     async (files: FileList | File[]) => {
       setParseError(null);
+      setParseWarnings([]);
       const fileArray = Array.from(files).filter(
         (f) => f.name.endsWith('.json') || f.type === 'application/json'
       );
@@ -27,6 +29,7 @@ export default function DragDropZone({ onItemsLoaded, disabled }: Props) {
       }
 
       const allItems: CrawledItem[] = [];
+      const warnings: string[] = [];
 
       for (const file of fileArray) {
         try {
@@ -34,10 +37,21 @@ export default function DragDropZone({ onItemsLoaded, disabled }: Props) {
           const parsed = JSON.parse(text);
           const items: CrawledItem[] = Array.isArray(parsed) ? parsed : [parsed];
           allItems.push(...items);
-        } catch {
-          setParseError(`Failed to parse ${file.name}: invalid JSON.`);
-          return;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          warnings.push(`${file.name}: ${msg}`);
         }
+      }
+
+      setParseWarnings(warnings);
+
+      if (allItems.length === 0) {
+        setParseError(
+          warnings.length > 0
+            ? 'All files failed to parse.'
+            : 'No items found in the provided files.'
+        );
+        return;
       }
 
       setLoadedCount(allItems.length);
@@ -145,6 +159,17 @@ export default function DragDropZone({ onItemsLoaded, disabled }: Props) {
 
       {parseError && (
         <p className="mt-2 text-sm text-red-600 dark:text-red-400">{parseError}</p>
+      )}
+
+      {parseWarnings.length > 0 && (
+        <div className="mt-2 text-sm text-yellow-600 dark:text-yellow-400">
+          <p className="font-medium">{parseWarnings.length} file{parseWarnings.length > 1 ? 's' : ''} failed to parse:</p>
+          <ul className="mt-1 text-xs space-y-0.5">
+            {parseWarnings.map((w, i) => (
+              <li key={i} className="font-mono">{w}</li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   );
