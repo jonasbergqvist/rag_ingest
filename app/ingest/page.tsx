@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import DragDropZone from '@/components/DragDropZone';
 import BatchProgress from '@/components/BatchProgress';
@@ -11,13 +11,14 @@ import {
   startImport,
   sendItems,
   finishImport,
-  chunkArray,
+  chunkItemsBySize,
   bootstrapRag,
   getTenantStatus,
+  RagFetchError,
 } from '@/lib/ragApi';
 import {
   fetchOptimizelyManifest,
-  loadOptimizelyBatch,
+  fetchOptimizelyItem,
 } from '@/lib/optimizelyImport';
 import type {
   BatchState,
@@ -29,7 +30,7 @@ import type {
 } from '@/lib/types';
 import type { CrawlManifest } from '@/lib/optimizelyImport';
 
-const BATCH_SIZE = 1;
+const FETCH_CONCURRENCY = 10;
 
 const initialSession: ImportSession = {
   phase: 'idle',
@@ -61,6 +62,7 @@ export default function IngestPage() {
   const [tenantStatus, setTenantStatus] = useState<TenantStatusResponse | null>(null);
   const [tenantStatusError, setTenantStatusError] = useState<string | null>(null);
   const [isTenantStatusPolling, setIsTenantStatusPolling] = useState(false);
+  const batchItemsRef = useRef<CrawledItem[][]>([]);
 
   const isConfigured =
     credentials.baseUrl.trim() !== '' &&
@@ -78,7 +80,7 @@ export default function IngestPage() {
     (source === 'files' && items.length > 0) ||
     (source === 'optimizely' && !!manifest);
 
-  const canStart = hasContent && isConfigured && !isImporting;
+  const canStart = hasContent && isConfigured && !isImporting && session.phase !== 'awaiting_decision';
   const canBootstrap = isConfigured && !isImporting && !bootstrapState.loading;
 
   const setPhase = (phase: ImportPhase) =>
@@ -110,74 +112,20 @@ export default function IngestPage() {
     }
   }, []);
 
-  const handleStart = useCallback(async () => {
-    if (!canStart) return;
-
-    let totalItems = 0;
-    if (source === 'files') {
-      totalItems = items.length;
-    } else if (source === 'optimizely' && manifest) {
-      totalItems = manifest.count;
-    } else {
-      return;
-    }
-
-    const batchCount = Math.ceil(totalItems / BATCH_SIZE);
-    const batchStates: BatchState[] = Array.from(
-      { length: batchCount },
-      (_, i) => ({
-        batchIndex: i,
-        itemCount: Math.min(BATCH_SIZE, totalItems - i * BATCH_SIZE),
-        status: 'pending',
-      })
-    );
-
-    setSession({
-      phase: 'starting',
-      importId: null,
-      batches: batchStates,
-      totalItems,
-    });
-
-    let importId: string;
-
-    try {
-      const result = await startImport(credentials);
-      importId = result.importId;
-      setSession((s) => ({ ...s, importId, phase: 'sending' }));
-    } catch (e) {
-      setSession((s) => ({
-        ...s,
-        phase: 'error',
-        error: `Failed to start import: ${e instanceof Error ? e.message : String(e)}`,
-      }));
-      return;
-    }
-
-    const fileBatches =
-      source === 'files' ? chunkArray(items, BATCH_SIZE) : null;
-
-    for (let i = 0; i < batchCount; i++) {
+  const sendBatches = useCallback(async (
+    importId: string,
+    batchIndices: number[],
+    allBatches: CrawledItem[][],
+  ) => {
+    for (const i of batchIndices) {
       setSession((s) => {
         const updated = [...s.batches];
-        updated[i] = { ...updated[i], status: 'sending' };
+        updated[i] = { ...updated[i], status: 'sending', error: undefined, errorStatus: undefined };
         return { ...s, batches: updated };
       });
 
       try {
-        let batchItems: CrawledItem[];
-        if (source === 'files' && fileBatches) {
-          batchItems = fileBatches[i];
-        } else if (source === 'optimizely' && manifest) {
-          batchItems = await loadOptimizelyBatch(
-            manifest.files,
-            i,
-            BATCH_SIZE
-          );
-        } else {
-          batchItems = [];
-        }
-
+        const batchItems = allBatches[i];
         await sendItems(credentials, importId, batchItems);
         setSession((s) => {
           const updated = [...s.batches];
@@ -186,14 +134,18 @@ export default function IngestPage() {
         });
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : String(e);
+        const errStatus = e instanceof RagFetchError ? e.status : undefined;
+        const itemUrls = allBatches[i].map((item) => item.SourceUrl);
         setSession((s) => {
           const updated = [...s.batches];
-          updated[i] = { ...updated[i], status: 'error', error: errMsg };
+          updated[i] = { ...updated[i], status: 'error', error: errMsg, errorStatus: errStatus, itemUrls };
           return { ...s, batches: updated };
         });
       }
     }
+  }, [credentials]);
 
+  const proceedToBootstrap = useCallback(async (importId: string) => {
     setPhase('done_sent');
     try {
       await finishImport(credentials, importId);
@@ -206,8 +158,6 @@ export default function IngestPage() {
       return;
     }
 
-    // All items have been acknowledged by the server. Explicitly start the
-    // schema bootstrap; the status panel will poll until it completes.
     setPhase('bootstrapping');
     try {
       const result = await bootstrapRag(credentials);
@@ -216,7 +166,127 @@ export default function IngestPage() {
       const errMsg = e instanceof Error ? e.message : String(e);
       setBootstrapState({ loading: false, result: null, error: errMsg });
     }
-  }, [canStart, credentials, items, manifest, source]);
+  }, [credentials]);
+
+  const handleStart = useCallback(async () => {
+    if (!canStart) return;
+
+    setSession({
+      phase: 'starting',
+      importId: null,
+      batches: [],
+      totalItems: 0,
+    });
+
+    let allItems: CrawledItem[];
+    try {
+      if (source === 'files') {
+        allItems = items;
+      } else if (source === 'optimizely' && manifest) {
+        const loaded: CrawledItem[] = [];
+        for (let i = 0; i < manifest.files.length; i += FETCH_CONCURRENCY) {
+          const slice = manifest.files.slice(i, i + FETCH_CONCURRENCY);
+          const fetched = await Promise.all(
+            slice.map((file) => fetchOptimizelyItem(file))
+          );
+          loaded.push(...fetched);
+        }
+        allItems = loaded;
+      } else {
+        return;
+      }
+    } catch (e) {
+      setSession((s) => ({
+        ...s,
+        phase: 'error',
+        error: `Failed to load content: ${e instanceof Error ? e.message : String(e)}`,
+      }));
+      return;
+    }
+
+    const allBatches = chunkItemsBySize(allItems);
+    batchItemsRef.current = allBatches;
+
+    const totalItems = allItems.length;
+    const batchStates: BatchState[] = allBatches.map((batch, i) => ({
+      batchIndex: i,
+      itemCount: batch.length,
+      status: 'pending' as const,
+    }));
+
+    let importId: string;
+    try {
+      const result = await startImport(credentials);
+      importId = result.importId;
+      setSession({ phase: 'sending', importId, batches: batchStates, totalItems });
+    } catch (e) {
+      setSession((s) => ({
+        ...s,
+        phase: 'error',
+        error: `Failed to start import: ${e instanceof Error ? e.message : String(e)}`,
+      }));
+      return;
+    }
+
+    const allIndices = Array.from({ length: allBatches.length }, (_, i) => i);
+    await sendBatches(importId, allIndices, allBatches);
+
+    // Read committed state — updater sees latest value after sequential awaits in sendBatches
+    const currentSession = await new Promise<ImportSession>((resolve) => {
+      setSession((s) => { resolve(s); return s; });
+    });
+
+    const hasFailures = currentSession.batches.some((b) => b.status === 'error');
+
+    if (!hasFailures) {
+      await proceedToBootstrap(importId);
+    } else {
+      setPhase('awaiting_decision');
+    }
+  }, [canStart, credentials, items, manifest, source, sendBatches, proceedToBootstrap]);
+
+  const handleRetryFailed = useCallback(async () => {
+    // Read committed state to avoid stale closure over session.batches
+    const snap = await new Promise<ImportSession>((resolve) => {
+      setSession((s) => { resolve(s); return s; });
+    });
+
+    if (snap.phase !== 'awaiting_decision') return;
+    if (!snap.importId) return;
+
+    const failedIndices = snap.batches
+      .filter((b) => b.status === 'error')
+      .map((b) => b.batchIndex);
+
+    if (failedIndices.length === 0) return;
+
+    setPhase('sending');
+    await sendBatches(snap.importId, failedIndices, batchItemsRef.current);
+
+    // Re-read state after sends complete to evaluate results
+    const afterSend = await new Promise<ImportSession>((resolve) => {
+      setSession((s) => { resolve(s); return s; });
+    });
+
+    const stillFailed = afterSend.batches.some((b) => b.status === 'error');
+
+    if (!stillFailed) {
+      await proceedToBootstrap(snap.importId);
+    } else {
+      setPhase('awaiting_decision');
+    }
+  }, [sendBatches, proceedToBootstrap]);
+
+  const handleBootstrapAnyway = useCallback(async () => {
+    // Read committed state to avoid stale closure over session.importId
+    const snap = await new Promise<ImportSession>((resolve) => {
+      setSession((s) => { resolve(s); return s; });
+    });
+
+    if (snap.phase !== 'awaiting_decision') return;
+    if (!snap.importId) return;
+    await proceedToBootstrap(snap.importId);
+  }, [proceedToBootstrap]);
 
   const handleBootstrapComplete = useCallback(
     (status: 'ready' | 'error', errorMsg?: string) => {
@@ -242,6 +312,7 @@ export default function IngestPage() {
     setBootstrapState({ loading: false, result: null, error: null });
     setTenantStatus(null);
     setTenantStatusError(null);
+    batchItemsRef.current = [];
   };
 
   const handleBootstrap = useCallback(async () => {
@@ -323,7 +394,7 @@ export default function IngestPage() {
             </p>
           </div>
 
-          {(session.phase === 'complete' || session.phase === 'error') && (
+          {(session.phase === 'complete' || session.phase === 'error' || session.phase === 'awaiting_decision') && (
             <button
               onClick={handleReset}
               className="text-sm text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 border border-gray-300 dark:border-gray-600 rounded-md px-3 py-1.5 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
@@ -391,12 +462,12 @@ export default function IngestPage() {
 
             {source === 'files' && items.length > 0 && (
               <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
-                {items.length} items across {Math.ceil(items.length / BATCH_SIZE)} batches of {BATCH_SIZE}
+                {items.length} items ready to send
               </p>
             )}
             {source === 'optimizely' && manifest && (
               <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
-                {manifest.count} items from optimizely.com across {Math.ceil(manifest.count / BATCH_SIZE)} batches of {BATCH_SIZE}
+                {manifest.count} items from optimizely.com ready to send
               </p>
             )}
           </div>
@@ -646,6 +717,9 @@ export default function IngestPage() {
                 totalItems={session.totalItems}
                 importId={session.importId}
                 error={session.error}
+                onRetryFailed={handleRetryFailed}
+                onBootstrapAnyway={handleBootstrapAnyway}
+                onStartOver={handleReset}
               />
             </div>
           )}
