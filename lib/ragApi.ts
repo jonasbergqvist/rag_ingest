@@ -165,7 +165,7 @@ export async function getImportStatus(
 /**
  * POST /rag/bootstrap
  * Triggers a bootstrap of the RAG graph schema for the authenticated tenant.
- * An empty JSON object is accepted as a body; tenant identity comes from auth.
+ * Tenant identity comes from auth; sourceId must match the import source.
  */
 export async function bootstrapRag(
   credentials: RagCredentials
@@ -173,7 +173,7 @@ export async function bootstrapRag(
   const url = `${credentials.baseUrl.replace(/\/$/, "")}/rag/bootstrap`;
   return ragFetch<RagBootstrapResponse>(url, credentials, {
     method: "POST",
-    body: JSON.stringify({}),
+    body: JSON.stringify({ sourceId: 'merc' }),
   });
 }
 
@@ -203,25 +203,50 @@ export function chunkArray<T>(arr: T[], size: number): T[][] {
 const MAX_BATCH_BYTES = 900_000; // ~900KB, conservative margin under 1 MiB server limit
 const ENVELOPE_OVERHEAD = 100; // {"importId":"...","items":[]} wrapper
 
+function trimItemToFit(item: CrawledItem, budget: number): CrawledItem {
+  const withoutHtml = { ...item, BodyHtml: '' };
+  const baseSize = JSON.stringify(withoutHtml).length;
+  if (baseSize >= budget) return withoutHtml;
+  let htmlBudget = budget - baseSize;
+  let trimmed = { ...item, BodyHtml: item.BodyHtml.slice(0, htmlBudget) };
+  // JSON-escape expansion (quotes, newlines, etc.) can make the result larger
+  // than the slice length. Shrink iteratively until it fits.
+  while (JSON.stringify(trimmed).length > budget && htmlBudget > 0) {
+    htmlBudget = Math.floor(htmlBudget * 0.9);
+    trimmed = { ...item, BodyHtml: item.BodyHtml.slice(0, htmlBudget) };
+  }
+  if (JSON.stringify(trimmed).length > budget) return withoutHtml;
+  return trimmed;
+}
+
 /**
  * Group items into batches that fit within the server's body size limit.
- * Each item is measured by its JSON-serialized length. Items that individually
- * exceed the limit are sent as solo batches (the server may still reject them,
- * but we don't compound the problem by grouping them).
+ * Each item is measured by its JSON-serialized length. Items whose BodyHtml
+ * pushes them over the limit are trimmed (BodyMarkdown carries the same
+ * content in a compact form the server uses for RAG processing).
  */
 export function chunkItemsBySize(items: CrawledItem[]): CrawledItem[][] {
+  const itemBudget = MAX_BATCH_BYTES - ENVELOPE_OVERHEAD;
   const chunks: CrawledItem[][] = [];
   let current: CrawledItem[] = [];
   let currentSize = ENVELOPE_OVERHEAD;
 
   for (const item of items) {
-    const itemSize = JSON.stringify(item).length + 1; // +1 for array comma
+    let sized = item;
+    let itemSize = JSON.stringify(sized).length + 1; // +1 for array comma
+    if (itemSize > itemBudget) {
+      sized = trimItemToFit(item, itemBudget);
+      itemSize = JSON.stringify(sized).length + 1;
+      if (itemSize > itemBudget) {
+        console.warn(`Item ${item.SourceUrl} is ${itemSize} bytes after trimming (budget: ${itemBudget})`);
+      }
+    }
     if (current.length > 0 && currentSize + itemSize > MAX_BATCH_BYTES) {
       chunks.push(current);
       current = [];
       currentSize = ENVELOPE_OVERHEAD;
     }
-    current.push(item);
+    current.push(sized);
     currentSize += itemSize;
   }
 
