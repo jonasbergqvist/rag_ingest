@@ -37,7 +37,9 @@ export default function StatusPanel({ importId, credentials, expectedItems, acti
   // Keep latest values accessible inside the setInterval closure without re-creating it
   const expectedItemsRef = useRef(expectedItems);
   const onCompleteRef = useRef(onBootstrapComplete);
+  const activeRef = useRef(active);
   const prevActiveRef = useRef(active);
+  const seenBootstrappingRef = useRef(false);
   const pollRef = useRef<(() => Promise<void>) | null>(null);
 
   useEffect(() => {
@@ -47,6 +49,10 @@ export default function StatusPanel({ importId, credentials, expectedItems, acti
   useEffect(() => {
     onCompleteRef.current = onBootstrapComplete;
   }, [onBootstrapComplete]);
+
+  useEffect(() => {
+    activeRef.current = active;
+  }, [active]);
 
   const stopPolling = useCallback(() => {
     clearInterval(timerRef.current!);
@@ -68,11 +74,24 @@ export default function StatusPanel({ importId, credentials, expectedItems, acti
 
       const expected = expectedItemsRef.current;
 
-      if (result.bootstrap === 'ready' && result.counts.enqueued >= expected) {
+      if (result.bootstrap === 'bootstrapping') {
+        seenBootstrappingRef.current = true;
+      }
+
+      // A "ready" bootstrap is only terminal if it's from THIS import's
+      // bootstrap, not leftover tenant state from a prior run. We know
+      // it's fresh if (a) we've previously seen it in "bootstrapping"
+      // state, or (b) the parent is no longer actively orchestrating.
+      const isStaleReady =
+        result.bootstrap === 'ready' &&
+        activeRef.current &&
+        !seenBootstrappingRef.current;
+
+      if (result.bootstrap === 'ready' && result.counts.enqueued >= expected && !isStaleReady) {
         setIsDone(true);
         stopPolling();
         onCompleteRef.current?.('ready');
-      } else if (result.bootstrap === 'error') {
+      } else if (result.bootstrap === 'error' && (!activeRef.current || seenBootstrappingRef.current)) {
         setIsDone(true);
         stopPolling();
         onCompleteRef.current?.('error', result.bootstrapError ?? 'Unknown bootstrap error');
@@ -193,12 +212,13 @@ export default function StatusPanel({ importId, credentials, expectedItems, acti
 
           {status ? (
             <div className="space-y-3">
-              {/* Bootstrap status banner — suppress stale "ready" until items are enqueued */}
+              {/* Bootstrap status banner — suppress stale "ready" during active orchestration */}
               <BootstrapBanner
                 bootstrap={bootstrapStatus ?? null}
                 bootstrapError={status.bootstrapError}
                 enqueued={status.counts.enqueued}
                 expectedItems={expectedItems}
+                active={active}
               />
 
               {/* Import status row */}
@@ -262,15 +282,19 @@ function BootstrapBanner({
   bootstrapError,
   enqueued,
   expectedItems,
+  active,
 }: {
   bootstrap: string | null;
   bootstrapError: string | null;
   enqueued: number;
   expectedItems: number;
+  active: boolean;
 }) {
-  // If bootstrap is already "ready" but items haven't been enqueued yet,
-  // this is a stale result from a prior import on this tenant — show waiting.
-  const isStaleReady = bootstrap === 'ready' && expectedItems > 0 && enqueued < expectedItems;
+  // Stale if items haven't been enqueued yet, or if the parent is still
+  // orchestrating (the new bootstrap hasn't started yet).
+  const isStaleReady =
+    bootstrap === 'ready' &&
+    (active || (expectedItems > 0 && enqueued < expectedItems));
 
   if (bootstrap === 'ready' && !isStaleReady) {
     return (
@@ -292,7 +316,9 @@ function BootstrapBanner({
           <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
         </svg>
         <p className="text-sm text-blue-700 dark:text-blue-300">
-          Waiting for items to be enqueued&hellip;
+          {enqueued < expectedItems
+            ? 'Waiting for items to be enqueued…'
+            : 'Waiting for bootstrap to start…'}
         </p>
       </div>
     );
